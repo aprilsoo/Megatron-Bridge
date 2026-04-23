@@ -140,7 +140,10 @@ def _record_to_conversation(record: Dict[str, Any], image_folder: Optional[str])
             content_list = media_parts
         if not content_list:
             content_list = [{"type": "text", "text": content_str}]
-        conversation.append({"role": role, "content": content_list})
+        turn: Dict[str, Any] = {"role": role, "content": content_list}
+        if "weight" in msg:
+            turn["weight"] = msg["weight"]
+        conversation.append(turn)
     return conversation
 
 

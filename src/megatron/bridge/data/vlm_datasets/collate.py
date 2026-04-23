@@ -42,17 +42,51 @@ except ImportError:
     HAVE_QWEN_VL_UTILS = False
 
 
-def _gather_assistant_text_segments(example: dict) -> list[str]:
-    """Extract assistant text segments from the structured conversation example.
+# Debug: print first N collated samples (templated text + token ids).
+_DEBUG_PRINT_TOTAL = 2
+_DEBUG_PRINT_REMAINING = _DEBUG_PRINT_TOTAL
 
-    The example schema is expected to be {"conversation": [{"role": ..., "content": [...]} ...]} where
+
+def _debug_print_samples(texts, input_ids_batch, tokenizer):
+    """Print templated text and token ids for the first few training samples."""
+    global _DEBUG_PRINT_REMAINING
+    if _DEBUG_PRINT_REMAINING <= 0:
+        return
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:
+        rank = 0
+    if rank != 0:
+        return
+    for text, ids in zip(texts, input_ids_batch):
+        if _DEBUG_PRINT_REMAINING <= 0:
+            break
+        idx = _DEBUG_PRINT_TOTAL - _DEBUG_PRINT_REMAINING + 1
+        ids_list = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+        print(f"\n{'=' * 100}\n[DEBUG SAMPLE #{idx}] templated text:\n{text}", flush=True)
+        print(f"[DEBUG SAMPLE #{idx}] token ids ({len(ids_list)} tokens):\n{ids_list}", flush=True)
+        try:
+            decoded = tokenizer.decode(ids_list, skip_special_tokens=False)
+            print(f"[DEBUG SAMPLE #{idx}] decoded from ids:\n{decoded}", flush=True)
+        except Exception as e:
+            print(f"[DEBUG SAMPLE #{idx}] decode failed: {e}", flush=True)
+        print("=" * 100, flush=True)
+        _DEBUG_PRINT_REMAINING -= 1
+
+
+def _gather_assistant_text_segments(example: dict) -> list[tuple[str, float]]:
+    """Extract assistant text segments and their weights from the structured conversation example.
+
+    The example schema is expected to be {"conversation": [{"role": ..., "content": [...], "weight": ...} ...]} where
     content is a list of items like {"type": "text"|"image"|..., "text": "..."}.
-    Returns a list of concatenated text strings, one per assistant turn.
+    Returns a list of (text, weight) tuples, one per assistant turn. Weight defaults to 1.0 if absent.
+    When weight <= 0, the corresponding assistant turn should NOT contribute to loss.
     """
-    texts: list[str] = []
+    segments: list[tuple[str, float]] = []
     for turn in example.get("conversation", []):
         if turn.get("role") != "assistant":
             continue
+        weight = float(turn.get("weight", 1.0))
         parts = turn.get("content", [])
         buf = []
         if isinstance(parts, list):
@@ -62,8 +96,8 @@ def _gather_assistant_text_segments(example: dict) -> list[str]:
         elif isinstance(parts, str):
             buf.append(parts)
         if buf:
-            texts.append("".join(buf))
-    return texts
+            segments.append(("".join(buf), weight))
+    return segments
 
 
 def create_multiturn_loss_mask_by_search(
@@ -95,9 +129,24 @@ def create_multiturn_loss_mask_by_search(
                     return i + len(span_tokens)
         return start_from
 
+    def try_advance(span_text: str, start_from: int) -> int:
+        """Advance search start past a span without marking it (for weight <= 0 turns)."""
+        variants = [span_text, span_text + "\n", span_text.strip(), span_text.strip() + "\n"]
+        for text in variants:
+            span_tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+            if not span_tokens:
+                continue
+            for i in range(start_from, len(ids) - len(span_tokens) + 1):
+                if ids[i : i + len(span_tokens)] == span_tokens:
+                    return i + len(span_tokens)
+        return start_from
+
     search_start = 0
-    for asst_text in _gather_assistant_text_segments(example):
-        search_start = try_mark(asst_text, search_start)
+    for asst_text, weight in _gather_assistant_text_segments(example):
+        if weight > 0:
+            search_start = try_mark(asst_text, search_start)
+        else:
+            search_start = try_advance(asst_text, search_start)
 
     if sum(mask) == 0:
         warnings.warn("*" * 100)
@@ -244,6 +293,9 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
     labels[torch.isin(labels, skipped_tokens)] = -100
     batch["labels"] = labels
+
+    # Debug: print first few templated texts + token ids
+    _debug_print_samples(texts, batch["input_ids"], getattr(processor, "tokenizer", processor))
     # Ensure position_ids exist for the model
     if "position_ids" not in batch:
         batch_size, seq_len = batch["input_ids"].shape
@@ -625,11 +677,13 @@ def qwen2_audio_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]
 
     for i, example in enumerate(examples):
         ids = input_ids[i].tolist()
-        assistant_texts = _gather_assistant_text_segments(example)
+        assistant_segments = _gather_assistant_text_segments(example)
 
         # Find assistant span using backward search (like HF's Qwen2AudioCollator)
         found = -1
-        for asst_text in assistant_texts:
+        for asst_text, weight in assistant_segments:
+            if weight <= 0:
+                continue
             asst_token_ids = tokenizer(asst_text, add_special_tokens=False)["input_ids"]
             span_len = len(asst_token_ids)
             if span_len == 0:
