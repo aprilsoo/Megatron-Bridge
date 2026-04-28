@@ -105,6 +105,7 @@ Recipe Arguments:
 
 import argparse
 import inspect
+import sys
 from typing import Callable
 
 import megatron.bridge.recipes as recipes
@@ -151,16 +152,28 @@ ERR_INFER_MODE_FAILED = (
 )
 
 
-def parse_args() -> tuple[argparse.Namespace, list[str]]:
-    """Parse command-line arguments."""
+def parse_args() -> tuple[argparse.Namespace, list[str], set[str]]:
+    """Parse command-line arguments.
+
+    Returns:
+        (args, cli_overrides, cli_specified): parsed args, Hydra overrides, and set of CLI-specified arg names
+    """
     parser = argparse.ArgumentParser(
         description="Generic training script for LLM and diffusion models",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
+        "--config-file",
+        type=str,
+        default=None,
+        help="YAML config file. _args section provides CLI args (recipe, dataset, etc.), "
+             "remaining sections are Megatron-Bridge config overrides",
+    )
+    parser.add_argument(
         "--recipe",
         type=str,
-        required=True,
+        required=False,
+        default=None,
         help="Recipe function name (e.g., llama32_1b_pretrain_config, gemma3_1b_sft_config, gemma3_1b_peft_config)",
     )
     parser.add_argument(
@@ -215,7 +228,28 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         "Use a local path for more stable multinode training.",
     )
     args, cli_overrides = parser.parse_known_args()
-    return args, cli_overrides
+
+    # Detect which parameters were explicitly specified on the command line
+    # Use more robust detection: check exact argv matches with = for long options
+    cli_specified = set()
+    argv_set = set(sys.argv[1:])  # Exclude script name
+
+    for action in parser._actions:
+        if action.dest == 'help':
+            continue
+
+        # Check each option string (e.g., '--recipe', '--dataset')
+        for opt in action.option_strings:
+            # Exact match (flag alone: '--recipe' followed by value)
+            if opt in argv_set:
+                cli_specified.add(action.dest)
+                break
+            # Match with = (e.g., '--recipe=llama32')
+            if any(arg.startswith(f"{opt}=") for arg in argv_set):
+                cli_specified.add(action.dest)
+                break
+
+    return args, cli_overrides, cli_specified
 
 
 def load_recipe(
@@ -308,9 +342,95 @@ def infer_train_mode(recipe_name: str) -> str:
     raise ValueError(ERR_INFER_MODE_FAILED)
 
 
+def load_config_file(config_file: str) -> tuple[dict, dict]:
+    """Load config file and separate _args (CLI parameters) from Megatron-Bridge overrides.
+
+    Args:
+        config_file: Path to configuration file
+
+    Returns:
+        (args_dict, override_dict): CLI arguments dict and config overrides dict
+
+    Raises:
+        FileNotFoundError: File not found
+        ValueError: YAML format error or missing required fields
+    """
+    import os
+    import yaml
+    from pathlib import Path
+
+    # Path traversal protection: resolve to absolute path
+    config_path = Path(config_file).resolve()
+
+    # Exception handling: file not found
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_file}")
+
+    # Exception handling: YAML parsing error
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ValueError(f"Invalid YAML in {config_file}:\n{e}")
+
+    # Type check
+    if not isinstance(cfg, dict):
+        raise ValueError(
+            f"{config_file} must contain a YAML dictionary, got {type(cfg).__name__}"
+        )
+
+    # Extract _args
+    args_dict = cfg.pop('_args', {})
+    if not args_dict:
+        raise ValueError(
+            f"Missing required '_args' section in {config_file}.\n"
+            f"Please add CLI arguments like:\n"
+            f"_args:\n"
+            f"  recipe: <recipe_name>\n"
+            f"  dataset: <dataset_type>\n"
+            f"  step_func: <step_function>"
+        )
+
+    # Validate required fields
+    required = ['recipe']  # recipe is the only truly required field
+    missing = [k for k in required if k not in args_dict]
+    if missing:
+        raise ValueError(
+            f"Missing required fields in '_args' section of {config_file}: {missing}"
+        )
+
+    # Remove all reserved sections starting with _
+    for key in list(cfg.keys()):
+        if key.startswith('_'):
+            cfg.pop(key)
+
+    return args_dict, cfg  # cfg is pure override dict
+
+
 def main() -> None:
     """Run GPT training (pretrain or finetune)."""
-    args, cli_overrides = parse_args()
+    args, cli_overrides, cli_specified = parse_args()
+
+    override_dict = None
+    if args.config_file:
+        # Load config file (will raise exceptions handled at top level)
+        args_from_file, override_dict = load_config_file(args.config_file)
+
+        # Merge parameters: priority = CLI explicit > config file > argparse default
+        # Only update parameters that were NOT explicitly specified on CLI
+        known_args = vars(args).keys()
+        for key, value in args_from_file.items():
+            if key in known_args and key not in cli_specified:
+                setattr(args, key, value)
+
+    # Final check for required parameters
+    if not args.recipe:
+        if args.config_file:
+            sys.exit(f"Error: Missing 'recipe' in config file '{args.config_file}'")
+        else:
+            sys.exit("Error: --recipe is required (via CLI or --config-file)")
+
+    # step_func already has default value 'gpt_step' from argparse, no need to set again
 
     config: ConfigContainer = load_recipe(
         args.recipe,
@@ -334,6 +454,7 @@ def main() -> None:
 
     config = process_config_with_overrides(
         config,
+        config_dict=override_dict,
         cli_overrides=cli_overrides or None,
     )
 

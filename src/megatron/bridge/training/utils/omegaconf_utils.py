@@ -105,25 +105,33 @@ def apply_overrides(
 def process_config_with_overrides(
     config: DataclassInstance,
     config_filepath: str | None = None,
+    config_dict: dict | None = None,
     cli_overrides: list[str] | None = None,
 ) -> DataclassInstance:
     """Process a configuration object with optional YAML file and CLI overrides.
 
     This function provides a unified way to:
     1. Convert the config to OmegaConf while preserving callable fields
-    2. Merge an optional YAML configuration file
+    2. Merge an optional YAML configuration file or dictionary
     3. Apply optional CLI overrides using Hydra syntax
     4. Apply the final configuration back to the original object
+
+    Priority (from lowest to highest):
+    1. config (Recipe defaults)
+    2. config_filepath or config_dict (File/dict overrides)
+    3. cli_overrides (CLI overrides, highest priority)
 
     Args:
         config: The dataclass configuration instance to process
         config_filepath: Optional path to a YAML config file to merge
+        config_dict: Optional dictionary of config overrides to merge
         cli_overrides: Optional list of Hydra-style CLI override strings
 
     Returns:
         The modified configuration object with all overrides applied
 
     Raises:
+        ValueError: If both config_filepath and config_dict are specified
         FileNotFoundError: If the specified config_filepath does not exist
         OverridesError: If there's an error parsing CLI overrides
 
@@ -135,6 +143,10 @@ def process_config_with_overrides(
         ...     cli_overrides=["model_config.hidden_size=4096", "training_config.lr=1e-4"]
         ... )
     """
+    # Mutual exclusion check
+    if config_filepath and config_dict:
+        raise ValueError("Cannot specify both config_filepath and config_dict")
+
     # Convert config to OmegaConf, tracking excluded callable fields
     omega_conf, excluded_fields = create_omegaconf_dict_config(config)
 
@@ -147,6 +159,12 @@ def process_config_with_overrides(
         yaml_conf = OmegaConf.load(config_filepath)
         omega_conf = OmegaConf.merge(omega_conf, yaml_conf)
         logger.debug(f"Merged configuration from {config_filepath}")
+
+    # Merge config dict if provided
+    if config_dict:
+        dict_conf = OmegaConf.create(config_dict)
+        omega_conf = OmegaConf.merge(omega_conf, dict_conf)
+        logger.debug(f"Merged configuration from config_dict")
 
     # Apply CLI overrides if provided
     if cli_overrides:
