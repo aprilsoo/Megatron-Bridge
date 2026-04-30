@@ -141,10 +141,26 @@ def create_multiturn_loss_mask_by_search(
                     return i + len(span_tokens)
         return start_from
 
+    # Resolve <|im_end|> token id so we can include it in the loss mask for
+    # assistant turns (weight > 0).  Falls back gracefully if the token is
+    # absent from the vocabulary (e.g. non-Qwen tokenizers).
+    _im_end_ids = tokenizer("<|im_end|>", add_special_tokens=False)["input_ids"]
+    im_end_token_id = _im_end_ids[0] if len(_im_end_ids) == 1 else None
+
     search_start = 0
     for asst_text, weight in _gather_assistant_text_segments(example):
         if weight > 0:
-            search_start = try_mark(asst_text, search_start)
+            new_start = try_mark(asst_text, search_start)
+            # Mark the trailing <|im_end|> that closes the assistant turn.
+            if (
+                new_start > search_start
+                and im_end_token_id is not None
+                and new_start < len(ids)
+                and ids[new_start] == im_end_token_id
+            ):
+                mask[new_start] = 1
+                new_start += 1
+            search_start = new_start
         else:
             search_start = try_advance(asst_text, search_start)
 

@@ -22,7 +22,6 @@ import torch
 # Common special tokens across VLM models
 QWEN_TOKENS = [
     "<|im_start|>",
-    "<|im_end|>",
     "<|vision_start|>",
     "<|vision_end|>",
     "<|vision_pad|>",
