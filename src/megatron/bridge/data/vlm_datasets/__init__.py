@@ -42,6 +42,7 @@ from megatron.bridge.data.vlm_datasets.hf_dataset_makers import (
 )
 from megatron.bridge.data.vlm_datasets.hf_provider import HFDatasetConversationProvider
 from megatron.bridge.data.vlm_datasets.mock_provider import MockVLMConversationProvider
+from megatron.bridge.data.vlm_datasets.packed_conversation_dataset import VLMPackedConversationDataset
 from megatron.bridge.data.vlm_datasets.preloaded_provider import PreloadedVLMConversationProvider
 
 
@@ -56,6 +57,7 @@ __all__ = [
     "make_default_audio_dataset",
     # Dataset types/providers
     "VLMConversationDataset",
+    "VLMPackedConversationDataset",
     "HFDatasetConversationProvider",
     "PreloadedVLMConversationProvider",
     "MockVLMConversationProvider",

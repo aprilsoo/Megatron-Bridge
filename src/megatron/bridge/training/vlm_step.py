@@ -14,6 +14,7 @@
 
 import logging
 import math
+import time
 from functools import partial
 from typing import Any, Iterable
 
@@ -277,6 +278,41 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
     )
     enable_packing = getattr(cfg.dataset, "pack_sequences_in_batch", False)
 
+    # Fast path: dataset already produced cu_seqlens / max_seqlen (e.g.
+    # VLMPackedConversationDataset). Trust the pre-packed tensors and skip
+    # both the PP padding and the in-batch repacker. In-batch packing takes
+    # priority when both are enabled, to preserve backward compatibility.
+    prepacked = not enable_packing and batch.get("cu_seqlens") is not None and batch.get("max_seqlen") is not None
+    if prepacked:
+        if getattr(cfg.dataset, "pack_sequences_in_dataset", False) and getattr(
+            cfg.dataset, "pack_sequences_in_batch", False
+        ):
+            logger.warning(
+                "Both pack_sequences_in_dataset and pack_sequences_in_batch are enabled; "
+                "in-batch packing path is preferred and dataset cu_seqlens are ignored."
+            )
+        _cu = batch.get("cu_seqlens")
+        if _cu is not None:
+            if _cu.dim() == 1:
+                _num_samples = max(int(_cu.numel()) - 1, 0)
+            else:
+                # 2D: [batch, num_segments+1] per row
+                _num_samples = int(sum(max(int(row.numel()) - 1, 0) for row in _cu))
+            logger.info(
+                f"[prepacked] samples_in_batch={_num_samples}, "
+                f"cu_seqlens_shape={tuple(_cu.shape)}, max_seqlen={batch.get('max_seqlen')}"
+            )
+        return (
+            batch.get("tokens") if batch.get("tokens") is not None else batch.get("input_ids"),
+            batch.get("labels"),
+            batch.get("loss_mask"),
+            batch.get("attention_mask"),
+            batch.get("position_ids"),
+            batch.get("cu_seqlens"),
+            batch.get("max_seqlen"),
+            batch.get("visual_inputs"),
+        )
+
     if not enable_packing:
         # When using pipeline parallelism, ensure fixed shapes equal to cfg.model.seq_length
         if getattr(cfg.model, "pipeline_model_parallel_size", 1) > 1:
@@ -378,6 +414,15 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
 
         # # Add packing metadata
         logger.debug(f"Packed batch: cu_seqlens={cu_seqlens.tolist()}, max_seqlen={max_seqlen}")
+        if cu_seqlens is not None:
+            if cu_seqlens.dim() == 1:
+                _num_samples = max(int(cu_seqlens.numel()) - 1, 0)
+            else:
+                _num_samples = int(sum(max(int(row.numel()) - 1, 0) for row in cu_seqlens))
+            logger.info(
+                f"[in-batch packed] samples_in_batch={_num_samples}, "
+                f"cu_seqlens_shape={tuple(cu_seqlens.shape)}, max_seqlen={max_seqlen}"
+            )
     else:
         # No packing, use dummy values
         cu_seqlens = None

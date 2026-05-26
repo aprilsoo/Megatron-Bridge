@@ -164,10 +164,10 @@ def create_multiturn_loss_mask_by_search(
         else:
             search_start = try_advance(asst_text, search_start)
 
-    if sum(mask) == 0:
-        warnings.warn("*" * 100)
-        warnings.warn(f"All tokens are masked for example:\n{example}.")
-        warnings.warn("*" * 100)
+    # if sum(mask) == 0:
+    #     warnings.warn("*" * 100)
+    #     warnings.warn(f"All tokens are masked for example:\n{example}.")
+    #     warnings.warn("*" * 100)
 
     # Ensure pad/skipped tokens are masked
     ids_t = torch.tensor(ids)

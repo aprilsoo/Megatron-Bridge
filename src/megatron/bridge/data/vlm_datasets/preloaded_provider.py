@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from transformers import AutoProcessor
 
 from megatron.bridge.data.vlm_datasets.conversation_dataset import VLMConversationDataset
+from megatron.bridge.data.vlm_datasets.packed_conversation_dataset import VLMPackedConversationDataset
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 from megatron.bridge.training.config import DatasetBuildContext, DatasetProvider
 
@@ -205,6 +206,17 @@ class PreloadedVLMConversationProvider(DatasetProvider):
     # Enable batch-level online sequence packing
     pack_sequences_in_batch: bool = False
 
+    # Enable dataset-side fixed-token packing (text-only). When True each
+    # __getitem__ returns one pre-packed sample of length seq_length.
+    # Mutually exclusive with pack_sequences_in_batch in spirit; vlm_step gives
+    # priority to in-batch packing when both are enabled.
+    pack_sequences_in_dataset: bool = False
+    pack_sorted_strategy: Literal["bucket", "none"] = "bucket"
+    pack_align_multiple: int = 1
+    # Streaming token-pool size for VLMPackedConversationDataset. Larger pools
+    # yield better packing density at the cost of more tokenization per refill.
+    pack_pool_size: int = 5000
+
     def _build_split_dataset(
         self,
         split_path: Optional[str],
@@ -223,6 +235,16 @@ class PreloadedVLMConversationProvider(DatasetProvider):
         if not base_examples:
             logging.warning(f"No usable examples parsed from {split_path}")
             return None
+        if self.pack_sequences_in_dataset:
+            return VLMPackedConversationDataset(
+                base_examples=base_examples,
+                target_length=target_length,
+                processor=processor,
+                token_num_limit=self.seq_length,
+                pool_size=self.pack_pool_size,
+                sorted_strategy=self.pack_sorted_strategy,
+                align_multiple=self.pack_align_multiple,
+            )
         return VLMConversationDataset(
             base_examples=base_examples,
             target_length=target_length,
